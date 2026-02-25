@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { PathStep, Asset } from '@/types';
-import { ChevronDown, ChevronUp, Info, TrendingRight } from 'lucide-react';
+import { ChevronDown, ChevronUp, Info } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -139,7 +139,7 @@ function RouteEdgeComponent({
           />
         )}
       </div>
-      <TrendingRight className="absolute w-4 h-4 text-muted-foreground" />
+      {/* <TrendingRight className="absolute w-4 h-4 text-muted-foreground" /> */}
       <Badge
         variant="secondary"
         className={cn(

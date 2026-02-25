@@ -7,7 +7,6 @@ import {
   ChevronDown,
   ChevronUp,
   Info,
-  TrendingRight,
   Split,
 } from 'lucide-react';
 import { Card } from '@/components/ui/card';
@@ -94,7 +93,7 @@ function PathVisualization({
               )}
 
               <div className="flex flex-col items-center px-2">
-                <TrendingRight className="w-4 h-4 text-muted-foreground" />
+                {/* <TrendingRight className="w-4 h-4 text-muted-foreground" /> */}
                 <Badge
                   variant="secondary"
                   className={cn(
