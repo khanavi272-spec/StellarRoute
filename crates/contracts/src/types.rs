@@ -65,26 +65,13 @@ pub struct SwapResult {
     pub executed_at: u64,
 }
 
-// --- MEV Protection Types ---
-
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct CommitmentData {
-    pub sender: Address,
-    pub deposit_amount: i128,
-    pub created_at: u32,
-    pub expires_at: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct MevConfig {
-    pub commit_threshold: i128,
-    pub commit_window_ledgers: u32,
-    pub max_swaps_per_window: u32,
-    pub rate_limit_window: u32,
-    pub high_impact_threshold_bps: u32,
-    pub price_freshness_threshold_bps: u32,
+pub struct TTLStatus {
+    pub instance_ttl_remaining: u64,
+    pub pools_min_ttl: u64,
+    pub needs_extension: bool,
+    pub last_extended_ledger: u32,
 }
 
 // --- Fee Distribution Types ---

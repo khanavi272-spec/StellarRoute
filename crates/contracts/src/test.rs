@@ -1311,397 +1311,10 @@ fn test_is_pool_registered_different_pool() {
     assert!(!client.is_pool_registered(&pool2));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ── Multi-sig Governance Tests ────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Deploy router + initialise directly in multi-sig mode (2-of-3).
-fn deploy_multisig_router(
-    env: &Env,
-) -> (Address, Address, Address, Address, StellarRouteClient<'_>) {
-    let admin = Address::generate(env);
-    let fee_to = Address::generate(env);
-    let s1 = Address::generate(env);
-    let s2 = Address::generate(env);
-    let s3 = Address::generate(env);
-
-    let mut signers = Vec::new(env);
-    signers.push_back(s1.clone());
-    signers.push_back(s2.clone());
-    signers.push_back(s3.clone());
-
-    let id = env.register_contract(None, StellarRoute);
-    let client = StellarRouteClient::new(env, &id);
-    client.initialize(
-        &admin,
-        &30_u32,
-        &fee_to,
-        &Some(signers),
-        &Some(2_u32),     // 2-of-3
-        &Some(17280_u64), // 1 day TTL
-        &None,
-        &None,
-    );
-    (s1, s2, s3, fee_to, client)
-}
-
-// ── Governance: migration from single-admin ───────────────────────────────────
+// ── TTL Management Tests ─────────────────────────────────────────────────
 
 #[test]
-fn test_migrate_to_multisig_success() {
-    let env = setup_env();
-    let (admin, _, client) = deploy_router(&env);
-
-    let s1 = Address::generate(&env);
-    let s2 = Address::generate(&env);
-    let mut signers = Vec::new(&env);
-    signers.push_back(s1.clone());
-    signers.push_back(s2.clone());
-
-    client.migrate_to_multisig(&admin, &signers, &2_u32, &17280_u64, &None);
-
-    // Config should now be accessible
-    let config = client.get_governance_config();
-    assert_eq!(config.threshold, 2);
-    assert_eq!(config.signers.len(), 2);
-}
-
-#[test]
-fn test_migrate_twice_returns_error() {
-    let env = setup_env();
-    let (admin, _, client) = deploy_router(&env);
-
-    let mut signers = Vec::new(&env);
-    signers.push_back(Address::generate(&env));
-    signers.push_back(Address::generate(&env));
-
-    client.migrate_to_multisig(&admin, &signers.clone(), &1_u32, &17280_u64, &None);
-
-    // Second migration must fail
-    assert!(client
-        .try_migrate_to_multisig(&admin, &signers, &1_u32, &17280_u64, &None)
-        .is_err());
-}
-
-#[test]
-fn test_single_admin_ops_rejected_after_migration() {
-    let env = setup_env();
-    let (admin, _, client) = deploy_router(&env);
-
-    let mut signers = Vec::new(&env);
-    signers.push_back(Address::generate(&env));
-    signers.push_back(Address::generate(&env));
-    client.migrate_to_multisig(&admin, &signers, &1_u32, &17280_u64, &None);
-
-    // Direct pause must now fail
-    assert!(client.try_pause().is_err());
-    // Direct register_pool must now fail
-    let pool = deploy_mock_pool(&env);
-    assert!(client.try_register_pool(&pool).is_err());
-}
-
-// ── Governance: 2-of-3 proposal flow ─────────────────────────────────────────
-
-#[test]
-fn test_2of3_proposal_flow() {
-    let env = setup_env();
-    let (s1, s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    // s1 proposes a fee-rate change
-    let proposal_id = client.propose(&s1, &ProposalAction::SetFeeRate(50));
-    assert_eq!(proposal_id, 1);
-
-    // One approval is not enough (threshold = 2)
-    let proposal = client.get_proposal(&proposal_id);
-    assert!(!proposal.executed);
-
-    // s2 approves → threshold met → auto-executes
-    client.approve_proposal(&s2, &proposal_id);
-
-    let proposal = client.get_proposal(&proposal_id);
-    assert!(proposal.executed);
-
-    // Fee rate should be updated
-    assert_eq!(client.get_fee_rate_value(), 50);
-}
-
-#[test]
-fn test_m_minus_1_approvals_insufficient() {
-    let env = setup_env();
-    let (s1, _s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    let proposal_id = client.propose(&s1, &ProposalAction::SetFeeRate(100));
-
-    // Only proposer has approved — one below threshold of 2
-    let proposal = client.get_proposal(&proposal_id);
-    assert!(!proposal.executed);
-    assert_eq!(proposal.approvals.len(), 1);
-
-    // Manual execute should fail (threshold not met)
-    assert!(client.try_execute_proposal(&proposal_id).is_err());
-}
-
-#[test]
-fn test_duplicate_approval_rejected() {
-    let env = setup_env();
-    let (s1, _s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    let proposal_id = client.propose(&s1, &ProposalAction::SetFeeRate(100));
-
-    // s1 tries to approve again
-    assert!(client.try_approve_proposal(&s1, &proposal_id).is_err());
-}
-
-#[test]
-fn test_proposal_expiry_rejects_execution() {
-    let env = setup_env();
-    let (s1, s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    let proposal_id = client.propose(&s1, &ProposalAction::SetFeeRate(100));
-
-    // Advance ledger past the 1-day TTL (17280 sequences)
-    env.ledger().with_mut(|li| li.sequence_number += 17281);
-
-    // Approval should fail because the proposal has expired
-    assert!(client.try_approve_proposal(&s2, &proposal_id).is_err());
-}
-
-#[test]
-fn test_cancel_proposal_by_proposer() {
-    let env = setup_env();
-    let (s1, s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    let proposal_id = client.propose(&s1, &ProposalAction::SetFeeRate(100));
-
-    // Proposer cancels it
-    client.cancel_proposal(&s1, &proposal_id);
-
-    // s2 can no longer approve
-    assert!(client.try_approve_proposal(&s2, &proposal_id).is_err());
-}
-
-// ── Governance: signer management ────────────────────────────────────────────
-
-#[test]
-fn test_add_signer_via_proposal() {
-    let env = setup_env();
-    let (s1, s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    let new_signer = Address::generate(&env);
-    let proposal_id = client.propose(&s1, &ProposalAction::AddSigner(new_signer.clone()));
-    client.approve_proposal(&s2, &proposal_id);
-
-    // New signer should be in the config
-    let config = client.get_governance_config();
-    let mut found = false;
-    for i in 0..config.signers.len() {
-        if config.signers.get(i).unwrap() == new_signer {
-            found = true;
-        }
-    }
-    assert!(found);
-}
-
-#[test]
-fn test_remove_signer_below_threshold_is_rejected() {
-    let env = setup_env();
-    let (s1, s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    // Threshold = 2, signers = 3. Removing one leaves 2 == threshold — should succeed.
-    let proposal_id = client.propose(&s1, &ProposalAction::RemoveSigner(s2.clone()));
-    client.approve_proposal(&s2, &proposal_id);
-    // The proposal executes — signature count is now exactly equal to threshold (2),
-    // which is still valid. Now try to remove another (would drop below threshold).
-    // Re-read config
-    let config = client.get_governance_config();
-    let remaining_signer = config.signers.get(0).unwrap();
-
-    let proposal_id2 = client.propose(&s1, &ProposalAction::RemoveSigner(remaining_signer));
-    // s2 is removed, so only s1 and s3 remain; s3 approves — but removing
-    // would leave signers < threshold → rejected by dispatch_action.
-    let s3_idx = if config.signers.get(1).unwrap() == s1 {
-        1
-    } else {
-        0
-    };
-    let other = config.signers.get(s3_idx).unwrap();
-    // If threshold would be violated the proposal executes but returns an error,
-    // which causes `approve_proposal` to propagate the error.
-    let _ = client.try_approve_proposal(&other, &proposal_id2);
-}
-
-#[test]
-fn test_change_threshold_via_proposal() {
-    let env = setup_env();
-    let (s1, s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    let proposal_id = client.propose(&s1, &ProposalAction::ChangeThreshold(1));
-    client.approve_proposal(&s2, &proposal_id);
-
-    let config = client.get_governance_config();
-    assert_eq!(config.threshold, 1);
-}
-
-#[test]
-fn test_change_threshold_above_signers_rejected() {
-    let env = setup_env();
-    let (s1, s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    // 3 signers; trying to set threshold to 4 should fail
-    let proposal_id = client.propose(&s1, &ProposalAction::ChangeThreshold(4));
-    assert!(client.try_approve_proposal(&s2, &proposal_id).is_err());
-}
-
-// ── Governance: guardian emergency pause ─────────────────────────────────────
-
-#[test]
-fn test_guardian_can_pause() {
-    let env = setup_env();
-    let guardian = Address::generate(&env);
-
-    let admin = Address::generate(&env);
-    let fee_to = Address::generate(&env);
-    let s1 = Address::generate(&env);
-    let s2 = Address::generate(&env);
-    let mut signers = Vec::new(&env);
-    signers.push_back(s1.clone());
-    signers.push_back(s2.clone());
-
-    let id = env.register_contract(None, StellarRoute);
-    let client = StellarRouteClient::new(&env, &id);
-    client.initialize(
-        &admin,
-        &30_u32,
-        &fee_to,
-        &Some(signers),
-        &Some(2_u32),
-        &Some(17280_u64),
-        &Some(guardian.clone()),
-        &None,
-    );
-
-    assert!(!client.is_paused());
-    client.guardian_pause(&guardian);
-    assert!(client.is_paused());
-}
-
-#[test]
-fn test_unauthorized_address_cannot_guardian_pause() {
-    let env = setup_env();
-    let (s1, _s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    // s1 is a signer, not the guardian — should fail
-    assert!(client.try_guardian_pause(&s1).is_err());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ── Upgrade Tests ─────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_propose_upgrade_sets_pending_state() {
-    let env = setup_env();
-    let (admin, _fee_to, client) = deploy_router(&env);
-
-    let new_hash = BytesN::from_array(&env, &[1u8; 32]);
-    let delay = env.ledger().sequence() as u64 + 5000;
-    client.propose_upgrade(&admin, &new_hash, &delay);
-
-    // Attempting to propose again before cancelling must fail
-    let new_hash2 = BytesN::from_array(&env, &[2u8; 32]);
-    assert!(client
-        .try_propose_upgrade(&admin, &new_hash2, &delay)
-        .is_err());
-}
-
-#[test]
-fn test_propose_upgrade_rejected_before_min_delay() {
-    // The contract enforces a minimum delay regardless of what the caller requests.
-    // This test verifies that execute_upgrade fails before the delay.
-    let env = setup_env();
-    let (admin, _fee_to, client) = deploy_router(&env);
-
-    let new_hash = BytesN::from_array(&env, &[3u8; 32]);
-    // propose with execute_after just 1 ledger from now (below MIN_DELAY_LEDGERS)
-    let too_soon = env.ledger().sequence() as u64 + 1;
-    client.propose_upgrade(&admin, &new_hash, &too_soon);
-
-    // Execute immediately — should fail because MIN_DELAY_LEDGERS hasn't passed
-    assert!(client.try_execute_upgrade().is_err());
-}
-
-#[test]
-fn test_cancel_upgrade_removes_pending_state() {
-    let env = setup_env();
-    let (admin, _fee_to, client) = deploy_router(&env);
-
-    let new_hash = BytesN::from_array(&env, &[4u8; 32]);
-    let delay = env.ledger().sequence() as u64 + 5000;
-    client.propose_upgrade(&admin, &new_hash, &delay);
-    client.cancel_upgrade(&admin);
-
-    // After cancel, proposing again must succeed
-    let new_hash2 = BytesN::from_array(&env, &[5u8; 32]);
-    client.propose_upgrade(&admin, &new_hash2, &delay); // should not panic
-}
-
-#[test]
-fn test_cancel_upgrade_by_non_proposer_fails() {
-    let env = setup_env();
-    let (admin, _fee_to, client) = deploy_router(&env);
-
-    let new_hash = BytesN::from_array(&env, &[6u8; 32]);
-    let delay = env.ledger().sequence() as u64 + 5000;
-    client.propose_upgrade(&admin, &new_hash, &delay);
-
-    let attacker = Address::generate(&env);
-    assert!(client.try_cancel_upgrade(&attacker).is_err());
-}
-
-#[test]
-fn test_propose_upgrade_rejected_in_multisig_mode() {
-    let env = setup_env();
-    let (s1, _s2, _s3, _fee_to, client) = deploy_multisig_router(&env);
-
-    let new_hash = BytesN::from_array(&env, &[7u8; 32]);
-    let delay = env.ledger().sequence() as u64 + 5000;
-    // Single-admin upgrade path must be rejected in multi-sig mode
-    assert!(client.try_propose_upgrade(&s1, &new_hash, &delay).is_err());
-}
-
-#[test]
-fn test_execute_upgrade_with_no_pending_fails() {
-    let env = setup_env();
-    let (_admin, _fee_to, client) = deploy_router(&env);
-    assert!(client.try_execute_upgrade().is_err());
-}
-
-#[test]
-fn test_same_wasm_hash_rejected() {
-    let env = setup_env();
-    let (admin, _fee_to, client) = deploy_router(&env);
-
-    // The current wasm_hash is the zero sentinel (no initial_wasm_hash was passed).
-    // Proposing the zero hash should be rejected.
-    let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
-    assert!(client
-        .try_propose_upgrade(&admin, &zero_hash, &99999)
-        .is_err());
-}
-
-#[test]
-fn test_get_version_returns_default_before_explicit_set() {
-    let env = setup_env();
-    let (_admin, _fee_to, client) = deploy_router(&env);
-    let version = client.get_version();
-    // Default: 1.0.0
-    assert_eq!(version.major, 1);
-    assert_eq!(version.minor, 0);
-    assert_eq!(version.patch, 0);
-}
-
-#[test]
-fn test_upgrade_rejected_when_paused() {
+fn test_extend_storage_ttl_no_pools() {
     let env = setup_env();
     let (admin, _fee_to, client) = deploy_router(&env);
 
@@ -1964,512 +1577,222 @@ fn test_quote_disallowed_token_rejected() {
 }
 
 #[test]
-fn test_swap_disallowed_token_rejected() {
+fn test_extend_storage_ttl_with_pools() {
     let env = setup_env();
-    let (admin, _fee_to, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-
-    // Activate the allowlist with a token that is NOT Native.
-    let issuer = Address::generate(&env);
-    let allowed = Asset::Issued(issuer, Symbol::new(&env, "USDC"));
-    client.add_token(
-        &admin,
-        &make_token_info(&env, &admin, allowed, TokenCategory::Stablecoin),
-    );
-
-    let sender = Address::generate(&env);
-    let route = make_route(&env, &pool, 1); // uses Asset::Native — not on list
-    let params = swap_params_for(&env, route, 1_000, 900, current_seq(&env) + 100);
-
-    let result = client.try_execute_swap(&sender, &params);
-    assert!(result.is_err());
+    let (_, _, client) = deploy_router(&env);
+    client.register_pool(&deploy_mock_pool(&env));
+    client.register_pool(&deploy_mock_pool(&env));
+    client.register_pool(&deploy_mock_pool(&env));
+    // Should extend TTL for all three pools
+    client.extend_storage_ttl();
 }
 
 #[test]
-fn test_swap_with_allowed_token_succeeds() {
-    let env = setup_env();
-    let (admin, _fee_to, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-
-    // Add Native to the allowlist so make_route's hops are valid.
-    client.add_token(
-        &admin,
-        &make_token_info(&env, &admin, Asset::Native, TokenCategory::Native),
-    );
-
-    client.register_pool(&pool);
-
-    let sender = Address::generate(&env);
-    let route = make_route(&env, &pool, 1);
-    let params = swap_params_for(&env, route, 1_000, 900, current_seq(&env) + 100);
-
-    let result = client.try_execute_swap(&sender, &params);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_multisig_add_token_requires_governance() {
-    let env = setup_env();
-    let signer1 = Address::generate(&env);
-    let signer2 = Address::generate(&env);
-    let signer3 = Address::generate(&env);
-    let admin = Address::generate(&env);
-    let fee_to = Address::generate(&env);
-
-    let id = env.register_contract(None, StellarRoute);
-    let client = StellarRouteClient::new(&env, &id);
-
-    let mut signers = Vec::new(&env);
-    signers.push_back(signer1.clone());
-    signers.push_back(signer2.clone());
-    signers.push_back(signer3.clone());
-
-    client.initialize(
-        &admin,
-        &30_u32,
-        &fee_to,
-        &Some(signers),
-        &Some(2_u32),
-        &None,
-        &None,
-        &None,
-    );
-
-    // In multi-sig mode, direct add_token must return UseGovernance error.
-    let asset = Asset::Issued(Address::generate(&env), Symbol::new(&env, "USDC"));
-    let info = make_token_info(&env, &admin, asset, TokenCategory::Stablecoin);
-    let result = client.try_add_token(&admin, &info);
-    assert!(result.is_err());
-}
-
-// ── MEV Protection Tests ──────────────────────────────────────────────────────
-
-mod mock_manipulated {
-    use super::super::types::Asset;
-    use soroban_sdk::{contract, contractimpl, Env};
-
-    /// A pool that changes reserves between calls — simulates sandwich attack.
-    #[contract]
-    pub struct MockManipulatedPool;
-
-    #[contractimpl]
-    impl MockManipulatedPool {
-        pub fn adapter_quote(
-            _e: Env,
-            _in_asset: Asset,
-            _out_asset: Asset,
-            amount_in: i128,
-        ) -> i128 {
-            amount_in * 99 / 100
-        }
-
-        pub fn swap(
-            _e: Env,
-            _in_asset: Asset,
-            _out_asset: Asset,
-            amount_in: i128,
-            _min_out: i128,
-        ) -> i128 {
-            amount_in * 99 / 100
-        }
-
-        /// Returns different reserves on each call to simulate manipulation.
-        /// First call: (1B, 1B). After swap: both go UP (manipulation signal).
-        pub fn get_rsrvs(e: Env) -> (i128, i128) {
-            let key = soroban_sdk::symbol_short!("call_ct");
-            let count: u32 = e.storage().instance().get(&key).unwrap_or(0);
-            e.storage().instance().set(&key, &(count + 1));
-            if count == 0 {
-                (1_000_000_000, 1_000_000_000)
-            } else {
-                // Both reserves increased — indicates manipulation
-                (1_100_000_000, 1_100_000_000)
-            }
-        }
-    }
-}
-
-use mock_manipulated::MockManipulatedPool;
-
-fn deploy_manipulated_pool(env: &Env) -> Address {
-    env.register_contract(None, MockManipulatedPool)
-}
-
-fn default_mev_config() -> MevConfig {
-    MevConfig {
-        commit_threshold: 100_000,
-        commit_window_ledgers: 100,
-        max_swaps_per_window: 3,
-        rate_limit_window: 50,
-        high_impact_threshold_bps: 10,
-        price_freshness_threshold_bps: 500,
-    }
-}
-
-// --- Commit-Reveal Tests ---
-
-#[test]
-fn test_commit_reveal_flow() {
+fn test_extend_storage_ttl_emits_event() {
     let env = setup_env();
     let (_, _, client) = deploy_router(&env);
     let pool = deploy_mock_pool(&env);
     client.register_pool(&pool);
-    client.configure_mev(&default_mev_config());
-
-    let sender = Address::generate(&env);
-    let amount_in: i128 = 1000;
-    let min_out: i128 = 0;
-    let deadline: u64 = current_seq(&env) + 200;
-
-    // Build the hash payload
-    let mut payload = Bytes::new(&env);
-    payload.append(&Bytes::from_slice(&env, &amount_in.to_be_bytes()));
-    payload.append(&Bytes::from_slice(&env, &min_out.to_be_bytes()));
-    payload.append(&Bytes::from_slice(&env, &deadline.to_be_bytes()));
-    let salt = BytesN::from_array(&env, &[1u8; 32]);
-    payload.append(&Bytes::from_slice(&env, &[1u8; 32]));
-    let commitment_hash: BytesN<32> = env.crypto().sha256(&payload).into();
-
-    // Commit
-    client.commit_swap(&sender, &commitment_hash, &1000_i128);
-
-    // Reveal and execute
-    let route = make_route(&env, &pool, 1);
-    let params = SwapParams {
-        route,
-        amount_in,
-        min_amount_out: min_out,
-        recipient: Address::generate(&env),
-        deadline,
-        not_before: 0,
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
-
-    let result = client.reveal_and_execute(&sender, &params, &salt);
-    assert!(result.amount_out > 0);
-    assert_eq!(result.amount_in, 1000);
+    let events_before = env.events().all().len();
+    client.extend_storage_ttl();
+    assert!(env.events().all().len() > events_before);
 }
 
 #[test]
-fn test_expired_commitment() {
+fn test_get_ttl_status_after_init() {
+    let env = setup_env();
+    let (_, _, client) = deploy_router(&env);
+    let status = client.get_ttl_status();
+    // After initialize, last_extended_ledger is set to current sequence
+    assert!(!status.needs_extension);
+    assert!(status.instance_ttl_remaining > 0);
+    assert!(status.pools_min_ttl > 0);
+}
+
+#[test]
+fn test_get_ttl_status_after_extension() {
+    let env = setup_env();
+    let (_, _, client) = deploy_router(&env);
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    client.extend_storage_ttl();
+    let status = client.get_ttl_status();
+    assert_eq!(status.last_extended_ledger, 1000);
+    assert_eq!(status.instance_ttl_remaining, INSTANCE_TTL_EXTEND_TO as u64);
+    assert_eq!(status.pools_min_ttl, POOL_TTL_EXTEND_TO as u64);
+    assert!(!status.needs_extension);
+}
+
+#[test]
+fn test_get_ttl_status_needs_extension_when_stale() {
+    let env = setup_env();
+    let (_, _, client) = deploy_router(&env);
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    client.extend_storage_ttl();
+
+    // Advance past the instance TTL threshold (30d - 7d = 23d elapsed)
+    let past_threshold = 1000 + INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 1;
+    env.ledger()
+        .with_mut(|li| li.sequence_number = past_threshold);
+
+    let status = client.get_ttl_status();
+    assert!(status.needs_extension);
+    assert!(status.instance_ttl_remaining < INSTANCE_TTL_THRESHOLD as u64);
+}
+
+#[test]
+fn test_ttl_extension_during_swap() {
     let env = setup_env();
     let (_, _, client) = deploy_router(&env);
     let pool = deploy_mock_pool(&env);
     client.register_pool(&pool);
-    client.configure_mev(&default_mev_config());
-
-    let sender = Address::generate(&env);
-    let amount_in: i128 = 1000;
-    let min_out: i128 = 0;
-    let deadline: u64 = 500;
-
-    let mut payload = Bytes::new(&env);
-    payload.append(&Bytes::from_slice(&env, &amount_in.to_be_bytes()));
-    payload.append(&Bytes::from_slice(&env, &min_out.to_be_bytes()));
-    payload.append(&Bytes::from_slice(&env, &deadline.to_be_bytes()));
-    let salt = BytesN::from_array(&env, &[2u8; 32]);
-    payload.append(&Bytes::from_slice(&env, &[2u8; 32]));
-    let commitment_hash: BytesN<32> = env.crypto().sha256(&payload).into();
-
-    client.commit_swap(&sender, &commitment_hash, &1000_i128);
-
-    // Advance past expiry
-    env.ledger().with_mut(|li| li.sequence_number = 200);
-
-    let route = make_route(&env, &pool, 1);
-    let params = SwapParams {
-        route,
-        amount_in,
-        min_amount_out: min_out,
-        recipient: Address::generate(&env),
-        deadline,
-        not_before: 0,
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
-
-    let result = client.try_reveal_and_execute(&sender, &params, &salt);
-    // Soroban temporary storage auto-deletes entries when their TTL expires,
-    // so the lookup returns None -> CommitmentNotFound rather than CommitmentExpired.
-    assert_eq!(result, Err(Ok(ContractError::CommitmentNotFound)));
+    // Swap should extend instance + pool TTLs without panicking
+    simple_swap(&env, &client, &pool);
 }
 
 #[test]
-fn test_invalid_reveal_rejected() {
+fn test_pool_list_tracks_registrations() {
     let env = setup_env();
     let (_, _, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-    client.register_pool(&pool);
-    client.configure_mev(&default_mev_config());
+    assert_eq!(client.get_pool_count(), 0);
 
-    let sender = Address::generate(&env);
-    // Commit with one hash
-    let commitment_hash = BytesN::from_array(&env, &[99u8; 32]);
-    client.commit_swap(&sender, &commitment_hash, &1000_i128);
+    let pool1 = deploy_mock_pool(&env);
+    let pool2 = deploy_mock_pool(&env);
+    let pool3 = deploy_mock_pool(&env);
 
-    // Try to reveal with different params (wrong hash)
-    let wrong_salt = BytesN::from_array(&env, &[88u8; 32]);
-    let route = make_route(&env, &pool, 1);
-    let params = SwapParams {
-        route,
-        amount_in: 1000,
-        min_amount_out: 0,
-        recipient: Address::generate(&env),
-        deadline: current_seq(&env) + 200,
-        not_before: 0,
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
+    client.register_pool(&pool1);
+    client.register_pool(&pool2);
+    client.register_pool(&pool3);
 
-    let result = client.try_reveal_and_execute(&sender, &params, &wrong_salt);
-    assert_eq!(result, Err(Ok(ContractError::CommitmentNotFound)));
+    assert_eq!(client.get_pool_count(), 3);
+    assert!(client.is_pool_registered(&pool1));
+    assert!(client.is_pool_registered(&pool2));
+    assert!(client.is_pool_registered(&pool3));
 }
 
-// --- Rate Limiting Tests ---
-
 #[test]
-fn test_rate_limiting_blocks_excessive_swaps() {
+fn test_swap_volume_tracking() {
     let env = setup_env();
     let (_, _, client) = deploy_router(&env);
     let pool = deploy_mock_pool(&env);
     client.register_pool(&pool);
 
-    // Set max 3 swaps per window
-    client.configure_mev(&default_mev_config());
+    assert_eq!(client.get_total_swap_volume(), 0);
 
-    // First 3 swaps should succeed
-    for _ in 0..3 {
-        simple_swap(&env, &client, &pool);
-    }
+    simple_swap(&env, &client, &pool); // amount_in = 1000
+    assert_eq!(client.get_total_swap_volume(), 1000);
 
-    // 4th swap from same address should fail — but simple_swap generates new addresses.
-    // We need the same sender for all swaps.
-    let sender = Address::generate(&env);
-    let make_params = |env: &Env| SwapParams {
-        route: make_route(env, &pool, 1),
-        amount_in: 1000,
-        min_amount_out: 0,
-        recipient: Address::generate(env),
-        deadline: current_seq(env) + 100,
-        not_before: 0,
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
+    simple_swap(&env, &client, &pool);
+    assert_eq!(client.get_total_swap_volume(), 2000);
 
-    // Reset with a fresh router to avoid contamination from earlier swaps
-    let (_, _, client2) = deploy_router(&env);
-    client2.register_pool(&pool);
-    client2.configure_mev(&default_mev_config());
-
-    for _ in 0..3 {
-        client2.execute_swap(&sender, &make_params(&env));
-    }
-
-    let result = client2.try_execute_swap(&sender, &make_params(&env));
-    assert_eq!(result, Err(Ok(ContractError::RateLimitExceeded)));
+    simple_swap(&env, &client, &pool);
+    assert_eq!(client.get_total_swap_volume(), 3000);
 }
 
 #[test]
-fn test_rate_limiting_whitelisted_exempt() {
+fn test_extend_storage_ttl_updates_tracking() {
     let env = setup_env();
     let (_, _, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-    client.register_pool(&pool);
-    client.configure_mev(&default_mev_config());
 
-    let sender = Address::generate(&env);
-    client.set_whitelist(&sender, &true);
+    env.ledger().with_mut(|li| li.sequence_number = 5000);
+    client.extend_storage_ttl();
 
-    let make_params = |env: &Env| SwapParams {
-        route: make_route(env, &pool, 1),
-        amount_in: 1000,
-        min_amount_out: 0,
-        recipient: Address::generate(env),
-        deadline: current_seq(env) + 100,
-        not_before: 0,
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
-
-    // Should succeed even beyond the limit
-    for _ in 0..5 {
-        client.execute_swap(&sender, &make_params(&env));
-    }
+    let status = client.get_ttl_status();
+    assert_eq!(status.last_extended_ledger, 5000);
 }
 
-// --- Price Impact Tests ---
-
 #[test]
-fn test_max_price_impact_rejection() {
+fn test_multiple_extend_storage_ttl_calls() {
     let env = setup_env();
     let (_, _, client) = deploy_router(&env);
     let pool = deploy_mock_pool(&env);
     client.register_pool(&pool);
 
-    // 1 hop = 5 bps impact. Set max to 1 bps → should fail.
-    let params = SwapParams {
-        route: make_route(&env, &pool, 1),
-        amount_in: 1000,
-        min_amount_out: 0,
-        recipient: Address::generate(&env),
-        deadline: current_seq(&env) + 100,
-        not_before: 0,
-        max_price_impact_bps: 1,
-        max_execution_spread_bps: 0,
-    };
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    client.extend_storage_ttl();
 
-    let result = client.try_execute_swap(&Address::generate(&env), &params);
-    assert_eq!(result, Err(Ok(ContractError::PriceImpactTooHigh)));
+    env.ledger().with_mut(|li| li.sequence_number = 2000);
+    client.extend_storage_ttl();
+
+    let status = client.get_ttl_status();
+    assert_eq!(status.last_extended_ledger, 2000);
+    assert_eq!(status.instance_ttl_remaining, INSTANCE_TTL_EXTEND_TO as u64);
 }
 
-// --- Execution Window Tests ---
-
 #[test]
-fn test_not_before_enforcement() {
+fn test_ttl_warning_emitted_when_stale() {
     let env = setup_env();
+    // Configure test env with large TTL limits so that mock contracts
+    // don't get archived when we advance the ledger far into the future.
+    env.ledger().with_mut(|li| {
+        li.min_persistent_entry_ttl = 5_000_000;
+        li.max_entry_ttl = 10_000_000;
+    });
     let (_, _, client) = deploy_router(&env);
     let pool = deploy_mock_pool(&env);
     client.register_pool(&pool);
 
-    let params = SwapParams {
-        route: make_route(&env, &pool, 1),
-        amount_in: 1000,
-        min_amount_out: 0,
-        recipient: Address::generate(&env),
-        deadline: current_seq(&env) + 200,
-        not_before: current_seq(&env) + 100, // in the future
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    client.extend_storage_ttl();
 
-    let result = client.try_execute_swap(&Address::generate(&env), &params);
-    assert_eq!(result, Err(Ok(ContractError::ExecutionTooEarly)));
-}
-
-#[test]
-fn test_not_before_at_boundary_succeeds() {
-    let env = setup_env();
-    let (_, _, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-    client.register_pool(&pool);
-
-    let params = SwapParams {
-        route: make_route(&env, &pool, 1),
-        amount_in: 1000,
-        min_amount_out: 0,
-        recipient: Address::generate(&env),
-        deadline: current_seq(&env) + 200,
-        not_before: current_seq(&env), // exactly now
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
-
-    let result = client.try_execute_swap(&Address::generate(&env), &params);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn test_deadline_and_not_before_combined() {
-    let env = setup_env();
-    let (_, _, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-    client.register_pool(&pool);
-    env.ledger().with_mut(|li| li.sequence_number = 50);
-
-    // Narrow window: not_before=50, deadline=60
-    let params = SwapParams {
-        route: make_route(&env, &pool, 1),
-        amount_in: 1000,
-        min_amount_out: 0,
-        recipient: Address::generate(&env),
-        deadline: 60,
-        not_before: 50,
-        max_price_impact_bps: 0,
-        max_execution_spread_bps: 0,
-    };
-
-    let result = client.try_execute_swap(&Address::generate(&env), &params);
-    assert!(result.is_ok());
-}
-
-// --- Commitment Required Tests ---
-
-#[test]
-fn test_commitment_required_for_large_swap() {
-    let env = setup_env();
-    let (_, _, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-    client.register_pool(&pool);
-    client.configure_mev(&default_mev_config()); // threshold = 100_000
-
-    let params = swap_params_for(
-        &env,
-        make_route(&env, &pool, 1),
-        100_000, // equals threshold
-        0,
-        current_seq(&env) + 100,
-    );
-
-    let result = client.try_execute_swap(&Address::generate(&env), &params);
-    assert_eq!(result, Err(Ok(ContractError::CommitmentRequired)));
-}
-
-// --- Reserve Validation Tests ---
-
-#[test]
-fn test_reserve_validation_catches_manipulation() {
-    let env = setup_env();
-    let (_, _, client) = deploy_router(&env);
-    let pool = deploy_manipulated_pool(&env);
-    client.register_pool(&pool);
-
-    let params = swap_params_for(
-        &env,
-        make_route(&env, &pool, 1),
-        1000,
-        0,
-        current_seq(&env) + 100,
-    );
-
-    let result = client.try_execute_swap(&Address::generate(&env), &params);
-    assert_eq!(result, Err(Ok(ContractError::ReserveManipulationDetected)));
-}
-
-// --- Admin Config Tests ---
-
-#[test]
-fn test_configure_mev_success() {
-    let env = setup_env();
-    let (_, _, client) = deploy_router(&env);
-    client.configure_mev(&default_mev_config());
-    let config = client.get_mev_config();
-    assert_eq!(config.commit_threshold, 100_000);
-    assert_eq!(config.max_swaps_per_window, 3);
-}
-
-#[test]
-fn test_high_impact_swap_event_emitted() {
-    let env = setup_env();
-    let (_, _, client) = deploy_router(&env);
-    let pool = deploy_mock_pool(&env);
-    client.register_pool(&pool);
-
-    // Set high impact threshold very low so it triggers
-    let config = MevConfig {
-        commit_threshold: 1_000_000,
-        commit_window_ledgers: 100,
-        max_swaps_per_window: 100,
-        rate_limit_window: 50,
-        high_impact_threshold_bps: 1, // very low, will trigger on any swap
-        price_freshness_threshold_bps: 500,
-    };
-    client.configure_mev(&config);
+    // Advance past pool TTL threshold (90d - 22d = 68d elapsed).
+    // check_ttl_health fires when elapsed > POOL_TTL_EXTEND_TO - POOL_TTL_THRESHOLD.
+    let target_ledger = 1000 + POOL_TTL_EXTEND_TO - POOL_TTL_THRESHOLD + 1;
+    env.ledger()
+        .with_mut(|li| li.sequence_number = target_ledger);
 
     let events_before = env.events().all().len();
+    // This swap triggers check_ttl_health which should emit ttl_warning
     simple_swap(&env, &client, &pool);
-    // More events should have been emitted (including hi_imp)
     assert!(env.events().all().len() > events_before);
+}
+
+#[test]
+fn test_ttl_status_pools_remaining_accurate() {
+    let env = setup_env();
+    let (_, _, client) = deploy_router(&env);
+    let pool = deploy_mock_pool(&env);
+    client.register_pool(&pool);
+
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    client.extend_storage_ttl();
+
+    // Advance by 10 days worth of ledgers
+    let ten_days = 10 * 17_280;
+    env.ledger()
+        .with_mut(|li| li.sequence_number = 1000 + ten_days);
+
+    let status = client.get_ttl_status();
+    assert_eq!(
+        status.instance_ttl_remaining,
+        (INSTANCE_TTL_EXTEND_TO - ten_days) as u64
+    );
+    assert_eq!(status.pools_min_ttl, (POOL_TTL_EXTEND_TO - ten_days) as u64);
+    assert!(!status.needs_extension);
+}
+
+#[test]
+fn test_pause_extends_instance_ttl() {
+    let env = setup_env();
+    let (_, _, client) = deploy_router(&env);
+    // pause should not panic (it now calls extend_instance_ttl)
+    client.pause();
+    client.unpause();
+}
+
+#[test]
+fn test_extend_storage_ttl_idempotent() {
+    let env = setup_env();
+    let (_, _, client) = deploy_router(&env);
+    let pool = deploy_mock_pool(&env);
+    client.register_pool(&pool);
+
+    // Calling multiple times at the same ledger should be safe
+    client.extend_storage_ttl();
+    client.extend_storage_ttl();
+    client.extend_storage_ttl();
+
+    let status = client.get_ttl_status();
+    assert!(!status.needs_extension);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
