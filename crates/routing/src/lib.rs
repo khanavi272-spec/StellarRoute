@@ -8,15 +8,21 @@ pub mod health;
 pub mod impact;
 pub mod normalization;
 pub mod pathfinder;
+pub mod optimizer;
 
 pub use impact::{AmmQuoteCalculator, OrderbookImpactCalculator};
 pub use pathfinder::{LiquidityEdge, Pathfinder, PathfinderConfig, SwapPath};
+pub use optimizer::{
+    HybridOptimizer, OptimizerPolicy, OptimizerDiagnostics, RouteMetrics,
+    PolicyPresets
+};
 
 /// Routing engine with integrated pathfinding and impact calculations
 pub struct RoutingEngine {
     pathfinder: Pathfinder,
     amm_calculator: AmmQuoteCalculator,
     orderbook_calculator: OrderbookImpactCalculator,
+    hybrid_optimizer: HybridOptimizer,
 }
 
 impl RoutingEngine {
@@ -28,9 +34,10 @@ impl RoutingEngine {
     /// Create a new routing engine with custom config
     pub fn with_config(config: PathfinderConfig) -> Self {
         Self {
-            pathfinder: Pathfinder::new(config),
+            pathfinder: Pathfinder::new(config.clone()),
             amm_calculator: AmmQuoteCalculator,
             orderbook_calculator: OrderbookImpactCalculator,
+            hybrid_optimizer: HybridOptimizer::new(config),
         }
     }
 
@@ -47,6 +54,16 @@ impl RoutingEngine {
     /// Get reference to orderbook calculator
     pub fn orderbook_calculator(&self) -> &OrderbookImpactCalculator {
         &self.orderbook_calculator
+    }
+
+    /// Get reference to hybrid optimizer
+    pub fn hybrid_optimizer(&self) -> &HybridOptimizer {
+        &self.hybrid_optimizer
+    }
+
+    /// Get mutable reference to hybrid optimizer
+    pub fn hybrid_optimizer_mut(&mut self) -> &mut HybridOptimizer {
+        &mut self.hybrid_optimizer
     }
 }
 
