@@ -2,6 +2,7 @@
 
 use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -249,12 +250,12 @@ mod tests {
     async fn test_single_flight() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        let sf = SingleFlight::<u64>::new();
+        let sf = Arc::new(SingleFlight::<u64>::new());
         let counter = Arc::new(AtomicU64::new(0));
         let mut handlers = vec![];
 
         for _ in 0..10 {
-            let sf_ref = &sf;
+            let sf_ref = sf.clone();
             let counter_ref = counter.clone();
             handlers.push(tokio::spawn(async move {
                 sf_ref
