@@ -1,40 +1,18 @@
 "use client";
 
-import { useSettings } from '@/components/providers/settings-provider';
-import { formatRate, formatFee, formatPercentage } from '@/lib/formatting';
+import { QuoteSummarySkeleton } from "./QuoteSummarySkeleton";
 
 interface QuoteSummaryProps {
-  rate?: string;
-  fee?: string;
-  priceImpact?: string;
-  fromAmount?: number;
-  fromSymbol?: string;
-  toAmount?: number;
-  toSymbol?: string;
-  feeAmount?: number;
-  feeSymbol?: string;
-  priceImpactValue?: number;
+  rate: string;
+  fee: string;
+  priceImpact: string;
+  isLoading?: boolean;
 }
 
-export function QuoteSummary({ 
-  rate, 
-  fee, 
-  priceImpact,
-  fromAmount = 1,
-  fromSymbol = 'XLM',
-  toAmount,
-  toSymbol = 'USDC',
-  feeAmount,
-  feeSymbol = 'XLM',
-  priceImpactValue
-}: QuoteSummaryProps) {
-  const { settings } = useSettings();
-  const locale = settings.locale;
-
-  // Use provided formatted strings or generate them from numeric values
-  const displayRate = rate || (toAmount ? formatRate(fromAmount, fromSymbol, toAmount, toSymbol, locale) : '');
-  const displayFee = fee || (feeAmount !== undefined ? formatFee(feeAmount, feeSymbol, locale) : '');
-  const displayPriceImpact = priceImpact || (priceImpactValue !== undefined ? formatPercentage(priceImpactValue, locale) : '');
+export function QuoteSummary({ rate, fee, priceImpact, isLoading = false }: QuoteSummaryProps) {
+  if (isLoading) {
+    return <QuoteSummarySkeleton />;
+  }
 
   return (
     <div className="rounded-xl border border-border/50 p-4 space-y-3 bg-muted/30">
